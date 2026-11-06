@@ -1667,7 +1667,7 @@ fn test_unnecessary_dependency_suggestions() {
 
 #[test]
 fn test() {
-    use crate::tester::Tester;
+    use crate::{fixer::FixKind, tester::Tester};
 
     let pass = vec![
         r"function MyComponent() {
@@ -4403,6 +4403,38 @@ const Component = ({ filter }) => {
           const [, setState] = useState(0);
           useCallback(() => setState(1), [setState.foo]);
         }",
+        // https://github.com/oxc-project/oxc/issues/28884
+        r"function A({ section }) {
+          const ref = useRef(null);
+          useEffect(() => {
+            if (section === 'a') ref.current?.scrollIntoView();
+          }, [section, ref.current]);
+        }",
+        r"const OUTER = 1;
+        function B({ section }) {
+          useEffect(() => {
+            console.log(section, OUTER);
+          }, [section, OUTER]);
+        }",
+        r"const OUTER = 1;
+        function D({ section, page }) {
+          useEffect(() => {
+            console.log(section, page, OUTER);
+          }, [
+            section, // re-run when the tab changes
+            page,
+            OUTER,
+          ]);
+        }",
+        r"const OUTER = 1;
+        const OTHER = 2;
+        function C({ section }) {
+          const ref = useRef(null);
+          const other = useRef(null);
+          useEffect(() => {
+            if (section === 'a') ref.current?.scrollIntoView();
+          }, [section, ref.current, other.current, OUTER, OTHER]);
+        }",
     ];
 
     let pass_additional_hooks = vec![(
@@ -4558,6 +4590,61 @@ const Component = ({ filter }) => {
         ),
     ];
 
+    // https://github.com/oxc-project/oxc/issues/28884
+    let issue_28884_fix = vec![
+        // Removing effect deps changes when the effect runs, so plain `--fix` must leave them.
+        (
+            "function A({ section }) { const ref = useRef(null); useEffect(() => { if (section === 'a') ref.current?.scrollIntoView(); }, [section, ref.current]); }",
+            "function A({ section }) { const ref = useRef(null); useEffect(() => { if (section === 'a') ref.current?.scrollIntoView(); }, [section, ref.current]); }",
+            None,
+            FixKind::SafeFix,
+        ),
+        (
+            "const OUTER = 1; function B({ section }) { useEffect(() => { console.log(section, OUTER); }, [section, OUTER]); }",
+            "const OUTER = 1; function B({ section }) { useEffect(() => { console.log(section, OUTER); }, [section, OUTER]); }",
+            None,
+            FixKind::SafeFix,
+        ),
+        (
+            "const OUTER = 1;\nfunction D({ section, page }) {\n  useEffect(() => {\n    console.log(section, page, OUTER);\n  }, [\n    section, // re-run when the tab changes\n    page,\n    OUTER,\n  ]);\n}",
+            "const OUTER = 1;\nfunction D({ section, page }) {\n  useEffect(() => {\n    console.log(section, page, OUTER);\n  }, [\n    section, // re-run when the tab changes\n    page,\n    OUTER,\n  ]);\n}",
+            None,
+            FixKind::SafeFix,
+        ),
+        (
+            "const OUTER = 1; const OTHER = 2; function C({ section }) { const ref = useRef(null); const other = useRef(null); useEffect(() => { if (section === 'a') ref.current?.scrollIntoView(); }, [section, ref.current, other.current, OUTER, OTHER]); }",
+            "const OUTER = 1; const OTHER = 2; function C({ section }) { const ref = useRef(null); const other = useRef(null); useEffect(() => { if (section === 'a') ref.current?.scrollIntoView(); }, [section, ref.current, other.current, OUTER, OTHER]); }",
+            None,
+            FixKind::SafeFix,
+        ),
+        // Dangerous suggestions may remove the entries, but must not rewrite the whole array
+        // (comments and sibling formatting have to survive, and several removals must not overlap).
+        (
+            "function A({ section }) { const ref = useRef(null); useEffect(() => { if (section === 'a') ref.current?.scrollIntoView(); }, [section, ref.current]); }",
+            "function A({ section }) { const ref = useRef(null); useEffect(() => { if (section === 'a') ref.current?.scrollIntoView(); }, [section, ]); }",
+            None,
+            FixKind::DangerousSuggestion,
+        ),
+        (
+            "const OUTER = 1; function B({ section }) { useEffect(() => { console.log(section, OUTER); }, [section, OUTER]); }",
+            "const OUTER = 1; function B({ section }) { useEffect(() => { console.log(section, OUTER); }, [section, ]); }",
+            None,
+            FixKind::DangerousSuggestion,
+        ),
+        (
+            "const OUTER = 1;\nfunction D({ section, page }) {\n  useEffect(() => {\n    console.log(section, page, OUTER);\n  }, [\n    section, // re-run when the tab changes\n    page,\n    OUTER,\n  ]);\n}",
+            "const OUTER = 1;\nfunction D({ section, page }) {\n  useEffect(() => {\n    console.log(section, page, OUTER);\n  }, [\n    section, // re-run when the tab changes\n    page,\n    \n  ]);\n}",
+            None,
+            FixKind::DangerousSuggestion,
+        ),
+        (
+            "const OUTER = 1; const OTHER = 2; function C({ section }) { const ref = useRef(null); const other = useRef(null); useEffect(() => { if (section === 'a') ref.current?.scrollIntoView(); }, [section, ref.current, other.current, OUTER, OTHER]); }",
+            "const OUTER = 1; const OTHER = 2; function C({ section }) { const ref = useRef(null); const other = useRef(null); useEffect(() => { if (section === 'a') ref.current?.scrollIntoView(); }, [section,    ]); }",
+            None,
+            FixKind::DangerousSuggestion,
+        ),
+    ];
+
     Tester::new(
         ExhaustiveDeps::NAME,
         ExhaustiveDeps::PLUGIN,
@@ -4568,7 +4655,12 @@ const Component = ({ filter }) => {
             .collect::<Vec<_>>(),
         fail.iter().map(|&code| (code, None)).chain(fail_additional_hooks).collect::<Vec<_>>(),
     )
-    .expect_fix(fix)
+    .expect_fix({
+        let mut cases: Vec<crate::tester::ExpectFixTestCase> =
+            fix.into_iter().map(Into::into).collect();
+        cases.extend(issue_28884_fix.into_iter().map(Into::into));
+        cases
+    })
     .test_and_snapshot();
 }
 
